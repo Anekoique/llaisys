@@ -7,6 +7,21 @@
 #include <sstream>
 
 namespace llaisys {
+namespace {
+size_t numel_from_shape(const std::vector<size_t> &shape) {
+    return std::accumulate(shape.begin(), shape.end(), size_t(1), std::multiplies<size_t>());
+}
+
+std::vector<ptrdiff_t> contiguous_strides(const std::vector<size_t> &shape) {
+    std::vector<ptrdiff_t> strides(shape.size());
+    ptrdiff_t stride = 1;
+    for (size_t i = 1; i <= shape.size(); ++i) {
+        strides[shape.size() - i] = stride;
+        stride *= static_cast<ptrdiff_t>(shape[shape.size() - i]);
+    }
+    return strides;
+}
+} // namespace
 
 Tensor::Tensor(TensorMeta meta, core::storage_t storage, size_t offset)
     : _meta(std::move(meta)), _storage(std::move(storage)), _offset(offset) {}
@@ -164,42 +179,124 @@ void Tensor::debug() const {
 }
 
 bool Tensor::isContiguous() const {
-    TO_BE_IMPLEMENTED();
+    ptrdiff_t expected_stride = 1;
+    for (size_t i = 1; i <= _meta.shape.size(); ++i) {
+        size_t dim = _meta.shape.size() - i;
+        if (_meta.shape[dim] == 0) {
+            return true;
+        }
+        if (_meta.strides[dim] != expected_stride) {
+            return false;
+        }
+        expected_stride *= static_cast<ptrdiff_t>(_meta.shape[dim]);
+    }
     return true;
 }
 
 tensor_t Tensor::permute(const std::vector<size_t> &order) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    CHECK_ARGUMENT(order.size() == ndim(), "Permute: order size must equal tensor ndim.");
+
+    std::vector<uint8_t> seen(ndim(), 0);
+    TensorMeta new_meta = _meta;
+    for (size_t i = 0; i < order.size(); ++i) {
+        CHECK_ARGUMENT(order[i] < ndim(), "Permute: order index out of range.");
+        CHECK_ARGUMENT(seen[order[i]] == 0, "Permute: order contains duplicate dimensions.");
+        seen[order[i]] = 1;
+        new_meta.shape[i] = _meta.shape[order[i]];
+        new_meta.strides[i] = _meta.strides[order[i]];
+    }
+    return std::shared_ptr<Tensor>(new Tensor(std::move(new_meta), _storage, _offset));
 }
 
 tensor_t Tensor::view(const std::vector<size_t> &shape) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    CHECK_ARGUMENT(isContiguous(), "View: only contiguous tensors are supported for now.");
+    CHECK_ARGUMENT(numel_from_shape(shape) == numel(), "View: element count mismatch.");
+
+    TensorMeta new_meta{_meta.dtype, shape, contiguous_strides(shape)};
+    return std::shared_ptr<Tensor>(new Tensor(std::move(new_meta), _storage, _offset));
 }
 
 tensor_t Tensor::slice(size_t dim, size_t start, size_t end) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    CHECK_ARGUMENT(dim < ndim(), "Slice: dim out of range.");
+    CHECK_ARGUMENT(start <= end, "Slice: start must be <= end.");
+    CHECK_ARGUMENT(end <= _meta.shape[dim], "Slice: end out of range.");
+
+    TensorMeta new_meta = _meta;
+    new_meta.shape[dim] = end - start;
+    size_t new_offset = _offset + start * static_cast<size_t>(_meta.strides[dim]) * elementSize();
+    return std::shared_ptr<Tensor>(new Tensor(std::move(new_meta), _storage, new_offset));
 }
 
 void Tensor::load(const void *src_) {
-    TO_BE_IMPLEMENTED();
+    CHECK_ARGUMENT(src_ != nullptr || numel() == 0, "Load: source pointer is null.");
+    core::context().setDevice(deviceType(), deviceId());
+    llaisysMemcpyKind_t kind = (deviceType() == LLAISYS_DEVICE_CPU) ? LLAISYS_MEMCPY_H2H : LLAISYS_MEMCPY_H2D;
+    core::context().runtime().api()->memcpy_sync(data(), src_, numel() * elementSize(), kind);
 }
 
 tensor_t Tensor::contiguous() const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    if (isContiguous()) {
+        return std::shared_ptr<Tensor>(new Tensor(_meta, _storage, _offset));
+    }
+
+    auto out = Tensor::create(_meta.shape, _meta.dtype, deviceType(), deviceId());
+    const std::byte *src = data();
+    std::byte *dst = out->data();
+    const size_t elem_size = elementSize();
+    const size_t total = numel();
+    const size_t ndim_ = ndim();
+
+    if (ndim_ == 0) {
+        std::memcpy(dst, src, elem_size);
+        return out;
+    }
+
+    std::vector<size_t> idx(ndim_, 0);
+    for (size_t linear = 0; linear < total; ++linear) {
+        ptrdiff_t src_elem_offset = 0;
+        for (size_t d = 0; d < ndim_; ++d) {
+            src_elem_offset += static_cast<ptrdiff_t>(idx[d]) * _meta.strides[d];
+        }
+        std::memcpy(dst + linear * elem_size, src + src_elem_offset * static_cast<ptrdiff_t>(elem_size), elem_size);
+
+        for (size_t i = 1; i <= ndim_; ++i) {
+            size_t d = ndim_ - i;
+            idx[d]++;
+            if (idx[d] < _meta.shape[d]) {
+                break;
+            }
+            idx[d] = 0;
+        }
+    }
+    return out;
 }
 
 tensor_t Tensor::reshape(const std::vector<size_t> &shape) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    if (isContiguous()) {
+        return view(shape);
+    }
+    return contiguous()->view(shape);
 }
 
 tensor_t Tensor::to(llaisysDeviceType_t device_type, int device) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    int target_device = (device < 0) ? 0 : device;
+    if (deviceType() == device_type && deviceId() == target_device) {
+        return std::shared_ptr<Tensor>(new Tensor(_meta, _storage, _offset));
+    }
+
+    auto out = Tensor::create(_meta.shape, _meta.dtype, device_type, target_device);
+    llaisysMemcpyKind_t kind = LLAISYS_MEMCPY_D2D;
+    if (deviceType() == LLAISYS_DEVICE_CPU && device_type == LLAISYS_DEVICE_CPU) {
+        kind = LLAISYS_MEMCPY_H2H;
+    } else if (deviceType() == LLAISYS_DEVICE_CPU) {
+        kind = LLAISYS_MEMCPY_H2D;
+    } else if (device_type == LLAISYS_DEVICE_CPU) {
+        kind = LLAISYS_MEMCPY_D2H;
+    }
+
+    core::context().setDevice(out->deviceType(), out->deviceId());
+    core::context().runtime().api()->memcpy_sync(out->data(), data(), numel() * elementSize(), kind);
+    return out;
 }
 
 } // namespace llaisys

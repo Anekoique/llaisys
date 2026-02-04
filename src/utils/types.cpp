@@ -39,28 +39,47 @@ float _f16_to_f32(fp16_t val) {
 
 fp16_t _f32_to_f16(float val) {
     uint32_t f32;
-    memcpy(&f32, &val, sizeof(f32));               // Read the bits of the float32
-    uint16_t sign = (f32 >> 16) & 0x8000;          // Extract the sign bit
-    int32_t exponent = ((f32 >> 23) & 0xFF) - 127; // Extract and de-bias the exponent
-    uint32_t mantissa = f32 & 0x7FFFFF;            // Extract the mantissa (fraction part)
+    memcpy(&f32, &val, sizeof(f32));
 
-    if (exponent >= 16) { // Special cases for Inf and NaN
-        // NaN
-        if (exponent == 128 && mantissa != 0) {
-            return fp16_t{static_cast<uint16_t>(sign | 0x7E00)};
+    uint16_t sign = static_cast<uint16_t>((f32 >> 16) & 0x8000);
+    uint32_t exp = (f32 >> 23) & 0xFF;
+    uint32_t mant = f32 & 0x7FFFFF;
+
+    if (exp == 0xFF) {
+        if (mant == 0) {
+            return fp16_t{static_cast<uint16_t>(sign | 0x7C00)};
         }
-        // Infinity
-        return fp16_t{static_cast<uint16_t>(sign | 0x7C00)};
-    } else if (exponent >= -14) { // Normalized case
-        return fp16_t{(uint16_t)(sign | ((exponent + 15) << 10) | (mantissa >> 13))};
-    } else if (exponent >= -24) {
-        mantissa |= 0x800000; // Add implicit leading 1
-        mantissa >>= (-14 - exponent);
-        return fp16_t{(uint16_t)(sign | (mantissa >> 13))};
-    } else {
-        // Too small for subnormal: return signed zero
-        return fp16_t{(uint16_t)sign};
+        uint16_t nan_payload = static_cast<uint16_t>(mant >> 13);
+        return fp16_t{static_cast<uint16_t>(sign | 0x7C00 | nan_payload | 1)};
     }
+
+    int32_t half_exp = static_cast<int32_t>(exp) - 127 + 15;
+    if (half_exp >= 31) {
+        return fp16_t{static_cast<uint16_t>(sign | 0x7C00)};
+    }
+
+    if (half_exp <= 0) {
+        if (half_exp < -10) {
+            return fp16_t{sign};
+        }
+        mant |= 0x800000;
+        uint32_t shift = static_cast<uint32_t>(14 - half_exp);
+        uint32_t half_mant = mant >> shift;
+        uint32_t round_bit = (mant >> (shift - 1)) & 1u;
+        uint32_t sticky = mant & ((1u << (shift - 1)) - 1u);
+        if (round_bit && (sticky || (half_mant & 1u))) {
+            half_mant++;
+        }
+        return fp16_t{static_cast<uint16_t>(sign | half_mant)};
+    }
+
+    uint16_t half =
+        static_cast<uint16_t>(sign | (static_cast<uint16_t>(half_exp) << 10) | static_cast<uint16_t>(mant >> 13));
+    uint32_t round_bits = mant & 0x1FFF;
+    if (round_bits > 0x1000 || (round_bits == 0x1000 && (half & 1u))) {
+        half++;
+    }
+    return fp16_t{half};
 }
 
 float _bf16_to_f32(bf16_t val) {
@@ -75,7 +94,7 @@ bf16_t _f32_to_bf16(float val) {
     uint32_t bits32;
     std::memcpy(&bits32, &val, sizeof(bits32));
 
-    const uint32_t rounding_bias = 0x00007FFF + // 0111 1111 1111 1111
+    const uint32_t rounding_bias = 0x00007FFF +
                                    ((bits32 >> 16) & 1);
 
     uint16_t bf16_bits = static_cast<uint16_t>((bits32 + rounding_bias) >> 16);
